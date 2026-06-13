@@ -22,6 +22,9 @@ LLAMA_MODEL = "Llama-4-Maverick-17B-128E-Instruct-FP8"
 # Kept as aliases so existing call sites (model=...) keep working unchanged.
 gemini = gemini_mid = gemini_lite = LLAMA_MODEL
 
+from datetime import date
+TODAY = date.today().isoformat()  # e.g. "2026-06-13" — models have no live clock
+
 app = FastAPI()
 
 MODE_DESC = {
@@ -37,7 +40,8 @@ def sse(type: str, **kw) -> str:
     return f"data: {json.dumps({'type': type, **kw})}\n\n"
 
 
-def gemini_call(prompt: str, retries: int = 4, model=None) -> str:
+def gemini_call(prompt: str, retries: int = 4, model=None,
+                max_tokens: int = 4096) -> str:
     import time
     m = model or LLAMA_MODEL
     for attempt in range(retries):
@@ -45,6 +49,7 @@ def gemini_call(prompt: str, retries: int = 4, model=None) -> str:
             resp = llama.chat.completions.create(
                 model=m,
                 messages=[{"role": "user", "content": prompt}],
+                max_completion_tokens=max_tokens,
             )
             return resp.completion_message.content.text
         except Exception as e:
@@ -328,7 +333,8 @@ async def _browser_mode(url: str, task: str) -> AsyncIterator[str]:
 
     yield sse("step", msg="Building a clean input form for your task...")
 
-    form_prompt = f"""You are a UI generator for a "No-UI Browser". The user's goal:
+    form_prompt = f"""You are a UI generator for a "No-UI Browser". Today's date is {TODAY}.
+The user's goal:
 {task}
 
 {('Here is the real page content so you know what inputs the site needs:' + chr(10) + '--- BEGIN ---' + chr(10) + md + chr(10) + '--- END ---') if md else 'No page content available — infer the fields a user would need to provide for this task.'}
@@ -338,6 +344,7 @@ accomplish the goal on the real site (e.g. for a flight: from, to, date,
 passengers; for Airbnb: city, dates, guests). Rules:
 - Clean minimal form: labels + inputs, a single "Continue" submit button
 - Pick correct input types (date, number, text, select with real options if known)
+- For any date input, set min to {TODAY} and pre-fill a sensible future date
 - Pre-fill values that are already stated in the user's goal
 - DO NOT ask for passwords or payment — those are handled later in the live browser
 - All CSS in a <style> block. White bg, system sans-serif. No external deps.
@@ -384,20 +391,28 @@ def _build_automation_code(user_data: dict, task: str,
             "Do NOT invent secret credentials or card numbers."
         )
 
-    plan_prompt = f"""Write ASYNC Playwright Python to complete this task on a real website.
+    plan_prompt = f"""You are an expert web-automation engineer. Write ASYNC Playwright
+Python that drives a REAL website to help the user accomplish their goal.
 
-Task: {task}
-Starting URL: {url or 'navigate to the appropriate site'}
+Today's date is {TODAY}. Use it for any relative dates (e.g. "next week", "tomorrow").
+Goal: {task}
+Starting URL: {url or 'pick the best site and navigate there'}
 
-CRITICAL: The following two variables are ALREADY DEFINED in the execution environment.
-DO NOT redefine, reassign, or shadow them — just use them:
-  cdp_url   = (string) CDP websocket URL for the live browser
-  user_data = {json.dumps(user_data)}  ← these are the REAL user values
+These two variables ALREADY EXIST in the runtime — use them, never redefine them:
+  cdp_url   = CDP websocket URL for the live browser (string)
+  user_data = {json.dumps(user_data)}   ← the REAL values the user typed
 
-The code runs INSIDE an existing asyncio event loop. You MUST use the async API
-and await. NEVER use sync_playwright, asyncio.run, or browser.close().
+HARD RULES (breaking any of these makes the script crash — follow exactly):
+1. The code runs INSIDE a running asyncio loop. Use async/await everywhere.
+   NEVER use sync_playwright, asyncio.run(), browser.close(), exit(), sys.exit(),
+   quit(), or return at top level.
+2. EVERY page interaction (goto/fill/click/press/wait_for_selector) MUST be wrapped
+   in its own try/except so a single failure NEVER aborts the script. On failure,
+   print("STEP: <what failed, in plain words>") and continue to the next step.
+3. print("STEP: ...") before each meaningful action so the user sees progress.
+4. The script must always reach its final line and print the JSON summary.
 
-Use exactly this skeleton (do NOT add any user_data or cdp_url assignments):
+Start with EXACTLY this header (do not add cdp_url/user_data assignments):
 
 from playwright.async_api import async_playwright
 import json
@@ -406,30 +421,71 @@ browser = await p.chromium.connect_over_cdp(cdp_url)
 context = browser.contexts[0] if browser.contexts else await browser.new_context()
 page = context.pages[0] if context.pages else await context.new_page()
 
-# ── YOUR STEPS ──
-# Access user_data["field_name"] to get what the user typed
-# print("STEP: <description>") before each major action
-# Final line: print(json.dumps({{"status":"done","summary":"...","data":{{}}}}))
+Here is the REQUIRED style for every step (copy this pattern exactly):
 
-Rules:
-- await page.goto(url, timeout=30000); await page.fill(sel, val); await page.click(sel)
-- Dismiss cookie banners: try: await page.click("button:has-text('Accept')", timeout=5000)
-  except Exception: pass
-- await page.wait_for_timeout(1500) between major interactions
-- Use user_data values to fill the real site's fields
-- Wrap risky steps in try/except and print what failed
+print("STEP: Open the site")
+try:
+    await page.goto("https://example.com", timeout=30000)
+    await page.wait_for_timeout(1500)
+except Exception as e:
+    print(f"STEP: Could not open the site ({{e}})")
+
+try:
+    await page.click("button:has-text('Accept')", timeout=4000)
+except Exception:
+    pass
+
+The LAST line must ALWAYS be exactly:
+print(json.dumps({{"status":"done","summary":"<one sentence>","data":{{}}}}))
+
 {handoff_rule}
 
-Return ONLY raw Python code. No markdown fences. No comments explaining user_data or cdp_url."""
+Return ONLY raw Python. No markdown fences. No explanatory comments."""
 
-    r_text = gemini_call(plan_prompt)
+    r_text = gemini_call(plan_prompt, max_tokens=4096)
     code = strip_fences(r_text)
-    # Safety: strip any line that reassigns the injected globals
-    cleaned = "\n".join(
-        line for line in code.splitlines()
-        if not re.match(r"^\s*(cdp_url|user_data)\s*=", line)
-    )
-    return cleaned
+
+    safe_lines = []
+    for line in code.splitlines():
+        # Drop any reassignment of the injected globals
+        if re.match(r"^\s*(cdp_url|user_data)\s*=", line):
+            continue
+        indent = line[:len(line) - len(line.lstrip())]
+        stripped = line.strip()
+        # Neutralize calls that would abort the whole sandbox script
+        if re.match(r"^(sys\.)?exit\s*\(|^quit\s*\(", stripped):
+            safe_lines.append(f"{indent}pass")
+            continue
+        if "browser.close()" in stripped or "asyncio.run" in stripped:
+            safe_lines.append(f"{indent}pass")
+            continue
+        safe_lines.append(line)
+    code = "\n".join(safe_lines)
+
+    # Guard against truncated/invalid code reaching the sandbox: it runs inside an
+    # async wrapper, so validate by compiling it wrapped in `async def`.
+    import ast
+    try:
+        ast.parse("async def __m():\n" + "\n".join("    " + l for l in code.splitlines()))
+    except SyntaxError:
+        # Fall back to a minimal, always-valid navigate-and-handoff script.
+        target = url or "https://duckduckgo.com"
+        code = (
+            "from playwright.async_api import async_playwright\n"
+            "import json\n"
+            "p = await async_playwright().start()\n"
+            "browser = await p.chromium.connect_over_cdp(cdp_url)\n"
+            "context = browser.contexts[0] if browser.contexts else await browser.new_context()\n"
+            "page = context.pages[0] if context.pages else await context.new_page()\n"
+            'print("STEP: Opening the site for you")\n'
+            "try:\n"
+            f'    await page.goto({json.dumps(target)}, timeout=30000)\n'
+            "except Exception as e:\n"
+            '    print(f"STEP: Could not open the site ({e})")\n'
+            'print("STEP: Ready for you — take over the live browser now.")\n'
+            'print(json.dumps({"status":"done","summary":"Opened the site for manual takeover","data":{}}))\n'
+        )
+    return code
 
 
 async def _run_action(url: str, task: str, user_data: dict, mode: str) -> AsyncIterator[str]:
