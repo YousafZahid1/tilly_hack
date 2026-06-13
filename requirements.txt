@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+firecrawl-py
+google-generativeai
+python-dotenv

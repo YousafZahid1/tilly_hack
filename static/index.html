@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>No-UI Browser</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+      background: #f5f5f5;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      background: #111;
+      color: #fff;
+      padding: 20px 32px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    header h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    header p {
+      font-size: 0.8rem;
+      color: #999;
+      margin-top: 2px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      background: #4ade80;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .control-panel {
+      background: #fff;
+      border-bottom: 1px solid #e5e5e5;
+      padding: 20px 32px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .input-row {
+      display: flex;
+      gap: 10px;
+      align-items: stretch;
+    }
+
+    .input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      flex: 1;
+    }
+
+    label {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: #555;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    input[type="text"], input[type="url"] {
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 0.9rem;
+      font-family: inherit;
+      outline: none;
+      transition: border-color 0.15s;
+      width: 100%;
+      background: #fafafa;
+    }
+
+    input[type="text"]:focus, input[type="url"]:focus {
+      border-color: #111;
+      background: #fff;
+    }
+
+    button#generate-btn {
+      background: #111;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 24px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      align-self: flex-end;
+      transition: background 0.15s, opacity 0.15s;
+      font-family: inherit;
+    }
+
+    button#generate-btn:hover { background: #333; }
+    button#generate-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+    .examples {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .example-chip {
+      background: #f0f0f0;
+      border: 1px solid #e0e0e0;
+      border-radius: 20px;
+      padding: 4px 12px;
+      font-size: 0.76rem;
+      color: #444;
+      cursor: pointer;
+      transition: background 0.1s;
+      user-select: none;
+    }
+
+    .example-chip:hover { background: #e4e4e4; }
+
+    .result-area {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      position: relative;
+    }
+
+    #status-bar {
+      padding: 8px 32px;
+      font-size: 0.78rem;
+      color: #666;
+      background: #f9f9f9;
+      border-bottom: 1px solid #eee;
+      min-height: 32px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid #ddd;
+      border-top-color: #111;
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      flex-shrink: 0;
+      display: none;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    #result-iframe {
+      flex: 1;
+      border: none;
+      width: 100%;
+      min-height: calc(100vh - 200px);
+      background: #fff;
+      display: none;
+    }
+
+    .empty-state {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      color: #bbb;
+      padding: 60px 32px;
+    }
+
+    .empty-state svg { opacity: 0.3; }
+
+    .empty-state h2 {
+      font-size: 1.1rem;
+      font-weight: 500;
+      color: #ccc;
+    }
+
+    .empty-state p {
+      font-size: 0.85rem;
+      text-align: center;
+      max-width: 380px;
+      line-height: 1.6;
+    }
+
+    .error-banner {
+      background: #fff1f1;
+      border: 1px solid #fca5a5;
+      color: #b91c1c;
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin: 16px 32px;
+      font-size: 0.85rem;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="dot"></div>
+  <div>
+    <h1>No-UI Browser</h1>
+    <p>AI generates a task-specific interface from any webpage</p>
+  </div>
+</header>
+
+<div class="control-panel">
+  <div class="input-row">
+    <div class="input-group" style="flex: 2;">
+      <label for="url-input">URL</label>
+      <input type="url" id="url-input" placeholder="https://news.ycombinator.com" />
+    </div>
+    <div class="input-group" style="flex: 3;">
+      <label for="task-input">Your Goal</label>
+      <input type="text" id="task-input" placeholder="Show me only the top 5 stories about AI" />
+    </div>
+    <button id="generate-btn">Generate</button>
+  </div>
+
+  <div class="examples">
+    <span style="font-size:0.75rem; color:#999; line-height:26px;">Try:</span>
+    <span class="example-chip" data-url="https://news.ycombinator.com" data-task="Show me only the top 10 stories about AI or machine learning">HN: AI stories</span>
+    <span class="example-chip" data-url="https://www.imdb.com/chart/top/" data-task="Show me the top 20 movies as a clean ranked list with rating and year">IMDB Top 20</span>
+    <span class="example-chip" data-url="https://coinmarketcap.com" data-task="Show the top 10 cryptocurrencies by market cap in a minimal table">Crypto prices</span>
+    <span class="example-chip" data-url="https://github.com/trending" data-task="Show me trending repos as a table with name, stars, and description">GitHub Trending</span>
+  </div>
+</div>
+
+<div id="error-banner" class="error-banner"></div>
+
+<div id="status-bar">
+  <div class="spinner" id="spinner"></div>
+  <span id="status-text">Enter a URL and your goal above, then click Generate.</span>
+</div>
+
+<div class="result-area">
+  <div class="empty-state" id="empty-state">
+    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <rect x="3" y="3" width="18" height="18" rx="2"/>
+      <path d="M3 9h18M9 21V9"/>
+    </svg>
+    <h2>No interface generated yet</h2>
+    <p>Type any URL and describe your goal. The AI will scrape the page and build a minimal custom interface showing only what you need.</p>
+  </div>
+  <iframe id="result-iframe" sandbox="allow-scripts allow-same-origin" title="Generated Interface"></iframe>
+</div>
+
+<script>
+  const urlInput = document.getElementById('url-input');
+  const taskInput = document.getElementById('task-input');
+  const generateBtn = document.getElementById('generate-btn');
+  const iframe = document.getElementById('result-iframe');
+  const emptyState = document.getElementById('empty-state');
+  const statusText = document.getElementById('status-text');
+  const spinner = document.getElementById('spinner');
+  const errorBanner = document.getElementById('error-banner');
+
+  document.querySelectorAll('.example-chip').forEach(chip => {
+    chip.addEventListener('click', () => {
+      urlInput.value = chip.dataset.url;
+      taskInput.value = chip.dataset.task;
+    });
+  });
+
+  function setStatus(msg, loading = false) {
+    statusText.textContent = msg;
+    spinner.style.display = loading ? 'block' : 'none';
+  }
+
+  function showError(msg) {
+    errorBanner.textContent = msg;
+    errorBanner.style.display = 'block';
+  }
+
+  function clearError() {
+    errorBanner.style.display = 'none';
+    errorBanner.textContent = '';
+  }
+
+  generateBtn.addEventListener('click', async () => {
+    const url = urlInput.value.trim();
+    const task = taskInput.value.trim();
+
+    if (!url || !task) {
+      showError('Please enter both a URL and your goal.');
+      return;
+    }
+
+    clearError();
+    generateBtn.disabled = true;
+    setStatus('Scraping page with Firecrawl...', true);
+    emptyState.style.display = 'none';
+    iframe.style.display = 'none';
+
+    try {
+      setStatus('Scraping page with Firecrawl...', true);
+      const res = await fetch('/generate-ui', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, task }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new Error(err.detail || 'Server error');
+      }
+
+      setStatus('Generating interface with Gemini...', true);
+      const data = await res.json();
+
+      const blob = new Blob([data.html], { type: 'text/html' });
+      iframe.src = URL.createObjectURL(blob);
+      iframe.style.display = 'block';
+      setStatus('Done. AI-generated interface ready.', false);
+    } catch (err) {
+      showError(`Error: ${err.message}`);
+      emptyState.style.display = 'flex';
+      setStatus('Failed to generate interface.', false);
+    } finally {
+      generateBtn.disabled = false;
+    }
+  });
+
+  taskInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter') generateBtn.click();
+  });
+</script>
+</body>
+</html>
