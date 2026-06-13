@@ -328,6 +328,39 @@
       font-size: 0.8rem;
     }
 
+    /* ── MODE CHOOSER ── */
+    #mode-chooser {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+      background: #1a1a1a;
+      border-bottom: 1px solid var(--border);
+      flex-wrap: wrap;
+      flex-shrink: 0;
+    }
+
+    #mode-chooser.show { display: flex; }
+
+    .chooser-text { font-size: 0.78rem; color: #aaa; flex: 1; min-width: 200px; }
+
+    .chooser-btn {
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 7px 14px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      cursor: pointer;
+      font-family: inherit;
+      transition: border-color 0.1s, background 0.1s;
+      background: #0d0d0d;
+      color: var(--text);
+    }
+
+    .chooser-btn.agent:hover  { border-color: var(--purple); color: var(--purple); }
+    .chooser-btn.self:hover   { border-color: var(--amber);  color: var(--amber); }
+    .chooser-btn:disabled     { opacity: 0.4; cursor: not-allowed; }
+
     /* ── ERROR BANNER ── */
     #error-banner {
       display: none;
@@ -398,6 +431,11 @@
     </div>
 
     <div class="tab-content active" id="tab-ui">
+      <div id="mode-chooser">
+        <span class="chooser-text">Fill the form, then choose who completes it on the real site:</span>
+        <button class="chooser-btn agent" data-mode="agent">🤖 Agent does it</button>
+        <button class="chooser-btn self" data-mode="self">🙋 I'll take over</button>
+      </div>
       <div class="empty-state" id="ui-empty">
         <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
           <rect x="3" y="3" width="18" height="18" rx="2"/>
@@ -536,17 +574,94 @@
     browserTab.classList.add('active');
   }
 
-  // ── SSE handler ──────────────────────────────────────────────────────────────
+  // ── Mode chooser + connection state ───────────────────────────────────────────
 
-  async function execute() {
-    const url  = urlInput.value.trim();
-    const task = taskInput.value.trim();
-    if (!task) { showError('Please describe what you want to do.'); return; }
+  const modeChooser = document.getElementById('mode-chooser');
+  let pending = { url: '', task: '', values: null };
 
-    // Reset
+  function showChooser(url, task) {
+    pending = { url, task, values: pending.values };
+    modeChooser.classList.add('show');
+  }
+
+  function hideChooser() { modeChooser.classList.remove('show'); }
+
+  // Generated forms postMessage their values up to us
+  window.addEventListener('message', (e) => {
+    const d = e.data;
+    if (d && d.type === 'form-submit' && d.values) {
+      pending.values = d.values;
+      addLog('Form submitted — choose Agent or Take over above', 'info');
+    }
+  });
+
+  // ── Shared SSE stream consumer ─────────────────────────────────────────────────
+
+  async function consumeStream(resp) {
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ detail: resp.statusText }));
+      showError(err.detail || 'Server error');
+      return;
+    }
+    const reader  = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let evt;
+        try { evt = JSON.parse(line.slice(6)); } catch { continue; }
+
+        switch (evt.type) {
+          case 'step':
+            markLastLogDone();
+            addLog(evt.msg, 'running');
+            break;
+          case 'mode':
+            setModeBadge(evt.mode, evt.label);
+            break;
+          case 'form':
+            markLastLogDone();
+            addLog('Form ready — fill it in', 'done');
+            renderHtml(evt.html);
+            showChooser(evt.url, evt.task);
+            break;
+          case 'html':
+            markLastLogDone();
+            addLog('Interface generated', 'done');
+            renderHtml(evt.html);
+            break;
+          case 'live_view':
+            markLastLogDone();
+            addLog('Live browser is interactive — you can click in it', 'info');
+            showBrowserLive(evt.url);
+            break;
+          case 'done':
+            markLastLogDone();
+            addLog('Done', 'done');
+            break;
+          case 'error':
+            markLastLogDone();
+            addLog(evt.msg, 'error');
+            showError(evt.msg);
+            break;
+        }
+      }
+    }
+  }
+
+  function resetView() {
     clearLog();
     errorBanner.style.display = 'none';
     modeBadge.style.display = 'none';
+    hideChooser();
     resultIframe.style.display = 'none';
     resultIframe.src = 'about:blank';
     uiEmpty.style.display = 'flex';
@@ -554,10 +669,19 @@
     browserIframe.src = 'about:blank';
     browserEmpty.style.display = 'flex';
     browserDot.style.display = 'none';
+  }
+
+  // ── Phase 1: classify + READ/AGENT/form ────────────────────────────────────────
+
+  async function execute() {
+    const url  = urlInput.value.trim();
+    const task = taskInput.value.trim();
+    if (!task) { showError('Please describe what you want to do.'); return; }
+
+    resetView();
+    pending = { url: '', task: '', values: null };
     execBtn.disabled = true;
     execBtn.textContent = 'Running…';
-
-    let currentEntry = null;
 
     try {
       const resp = await fetch('/execute', {
@@ -565,65 +689,7 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, task }),
       });
-
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ detail: resp.statusText }));
-        showError(err.detail || 'Server error');
-        return;
-      }
-
-      const reader  = resp.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        const lines = buffer.split('\n');
-        buffer = lines.pop(); // keep incomplete last line
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          let evt;
-          try { evt = JSON.parse(line.slice(6)); } catch { continue; }
-
-          switch (evt.type) {
-            case 'step':
-              markLastLogDone();
-              currentEntry = addLog(evt.msg, 'running');
-              break;
-
-            case 'mode':
-              setModeBadge(evt.mode, evt.label);
-              break;
-
-            case 'html':
-              markLastLogDone();
-              addLog('Interface generated', 'done');
-              renderHtml(evt.html);
-              break;
-
-            case 'live_view':
-              markLastLogDone();
-              addLog('Live browser session active', 'info');
-              showBrowserLive(evt.url);
-              break;
-
-            case 'done':
-              markLastLogDone();
-              addLog('Done', 'done');
-              break;
-
-            case 'error':
-              markLastLogDone();
-              addLog(evt.msg, 'error');
-              showError(evt.msg);
-              break;
-          }
-        }
-      }
+      await consumeStream(resp);
     } catch (err) {
       showError(err.message);
     } finally {
@@ -631,6 +697,38 @@
       execBtn.textContent = 'Execute';
     }
   }
+
+  // ── Phase 2: drive the real site with the user's form data ──────────────────────
+
+  async function runAction(mode) {
+    if (!pending.values) {
+      showError('Fill out the form first (then click Continue inside it).');
+      return;
+    }
+    hideChooser();
+    document.querySelectorAll('.chooser-btn').forEach(b => b.disabled = true);
+    addLog(`Starting real-site automation (${mode === 'self' ? 'you take over' : 'agent drives'})`, 'running');
+
+    try {
+      const resp = await fetch('/run-action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url: pending.url, task: pending.task,
+          user_data: pending.values, mode,
+        }),
+      });
+      await consumeStream(resp);
+    } catch (err) {
+      showError(err.message);
+    } finally {
+      document.querySelectorAll('.chooser-btn').forEach(b => b.disabled = false);
+    }
+  }
+
+  document.querySelectorAll('.chooser-btn').forEach(btn => {
+    btn.addEventListener('click', () => runAction(btn.dataset.mode));
+  });
 
   execBtn.addEventListener('click', execute);
   taskInput.addEventListener('keydown', e => { if (e.key === 'Enter') execute(); });

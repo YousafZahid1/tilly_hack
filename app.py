@@ -9,14 +9,18 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import google.generativeai as genai
+from llama_api_client import LlamaAPIClient
 from firecrawl import Firecrawl
 
 load_dotenv()
 
 firecrawl = Firecrawl(api_key=os.getenv("FIRECRAWL_API_KEY"))
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-gemini = genai.GenerativeModel("gemini-2.5-flash")
+llama = LlamaAPIClient(api_key=os.getenv("LLAMA_API_KEY"),
+                       base_url="https://api.llama.com/v1/")
+
+LLAMA_MODEL = "Llama-4-Maverick-17B-128E-Instruct-FP8"
+# Kept as aliases so existing call sites (model=...) keep working unchanged.
+gemini = gemini_mid = gemini_lite = LLAMA_MODEL
 
 app = FastAPI()
 
@@ -31,6 +35,24 @@ MODE_DESC = {
 
 def sse(type: str, **kw) -> str:
     return f"data: {json.dumps({'type': type, **kw})}\n\n"
+
+
+def gemini_call(prompt: str, retries: int = 4, model=None) -> str:
+    import time
+    m = model or LLAMA_MODEL
+    for attempt in range(retries):
+        try:
+            resp = llama.chat.completions.create(
+                model=m,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return resp.completion_message.content.text
+        except Exception as e:
+            if "429" in str(e) and attempt < retries - 1:
+                time.sleep(10 * (attempt + 1))
+            else:
+                raise
+    raise RuntimeError("LLM retries exhausted")
 
 
 def strip_fences(text: str) -> str:
@@ -48,7 +70,30 @@ def extract_markdown(scraped) -> str:
 
 # ── intent classifier ──────────────────────────────────────────────────────────
 
+def _classify_heuristic(url: str, task: str) -> str | None:
+    """Fast keyword pre-classifier; returns None if ambiguous (falls through to Gemini)."""
+    t = task.lower()
+    browser_kws = {
+        "book", "buy", "purchase", "order", "sign up", "signup", "register",
+        "fill", "submit", "log in", "login", "apply", "reserve", "checkout",
+        "find flights", "find hotels", "schedule",
+    }
+    read_kws = {
+        "show", "list", "display", "extract", "get", "find", "top ", "summary",
+        "summarize", "what are", "latest", "scrape",
+    }
+    if any(kw in t for kw in browser_kws):
+        return "browser"
+    if url and any(kw in t for kw in read_kws):
+        return "read"
+    return None
+
+
 def _classify_sync(url: str, task: str) -> str:
+    fast = _classify_heuristic(url, task)
+    if fast:
+        return fast
+
     prompt = f"""Classify this web task into ONE mode:
 
 "read"    – user wants to VIEW / FIND / FILTER information already on a specific page
@@ -59,56 +104,131 @@ URL: {url or 'not given'}
 Task: {task}
 
 Reply with ONLY one word: read  agent  or  browser"""
-    r = gemini.generate_content(prompt)
-    m = r.text.strip().lower().split()[0]
+    r_text = gemini_call(prompt, model=gemini_lite)
+    m = r_text.strip().lower().split()[0]
     return m if m in ("read", "agent", "browser") else "agent"
 
 
 # ── READ mode ──────────────────────────────────────────────────────────────────
+
+def _firecrawl_extract(url: str, task: str):
+    """Ask Firecrawl itself to extract structured data (uses Firecrawl credits,
+    not the Gemini quota). Returns parsed JSON (dict/list) or None."""
+    doc = firecrawl.scrape(url, formats=[{
+        "type": "json",
+        "prompt": f"Extract all data relevant to this goal: {task}. "
+                  f"Return well-structured JSON with the key items as a list.",
+    }])
+    return getattr(doc, "json", None) or getattr(doc, "data", None)
+
+
+def _template_ui(task: str, data) -> str:
+    """Deterministic HTML renderer for structured JSON — no Gemini needed.
+    Renders the main list of records as filterable cards."""
+    # Find the primary list of records inside the JSON
+    records, fields = [], []
+    if isinstance(data, list):
+        records = data
+    elif isinstance(data, dict):
+        for v in data.values():
+            if isinstance(v, list) and v and isinstance(v[0], dict):
+                records = v
+                break
+        if not records:  # dict of scalars → single record
+            records = [data]
+    if records and isinstance(records[0], dict):
+        fields = list(records[0].keys())
+
+    def esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+
+    cards = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            rec = {"value": rec}
+        rows = []
+        title = None
+        for k in fields or rec.keys():
+            val = rec.get(k, "")
+            if title is None and isinstance(val, str) and val.strip():
+                title = val
+                continue
+            disp = (f'<a href="{esc(val)}" target="_blank">{esc(val)}</a>'
+                    if isinstance(val, str) and val.startswith("http")
+                    else esc(val))
+            rows.append(f'<div class="row"><span class="k">{esc(k)}</span>'
+                        f'<span class="v">{disp}</span></div>')
+        cards.append(f'<div class="card"><div class="title">{esc(title or "")}</div>'
+                     f'{"".join(rows)}</div>')
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+* {{ box-sizing: border-box; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background:#fff; color:#1a1a1a; margin:0; padding:24px; max-width:860px; margin:0 auto; }}
+h1 {{ font-size:1.5rem; margin:0 0 16px; }}
+#q {{ width:100%; padding:11px 14px; font-size:1rem; border:1px solid #ddd;
+  border-radius:8px; margin-bottom:20px; outline:none; }}
+#q:focus {{ border-color:#3b82f6; box-shadow:0 0 0 3px rgba(59,130,246,.15); }}
+.card {{ border:1px solid #eee; border-radius:10px; padding:16px 18px; margin-bottom:12px;
+  background:#fafafa; }}
+.card:hover {{ box-shadow:0 4px 14px rgba(0,0,0,.06); }}
+.title {{ font-weight:600; font-size:1.1rem; margin-bottom:8px; }}
+.row {{ display:flex; gap:10px; font-size:.92rem; padding:2px 0; }}
+.k {{ color:#888; min-width:120px; text-transform:capitalize; }}
+.v {{ color:#222; }}
+a {{ color:#2563eb; text-decoration:none; }} a:hover {{ text-decoration:underline; }}
+</style></head><body>
+<h1>{esc(task)}</h1>
+<input id="q" placeholder="Filter…" onkeyup="f()">
+<div id="list">{"".join(cards) or "<p>No structured data found.</p>"}</div>
+<script>
+function f(){{var t=document.getElementById('q').value.toLowerCase();
+document.querySelectorAll('.card').forEach(function(c){{
+c.style.display=c.textContent.toLowerCase().includes(t)?'':'none';}});}}
+</script></body></html>"""
+
 
 async def _read_mode(url: str, task: str) -> AsyncIterator[str]:
     if not url:
         yield sse("error", msg="READ mode needs a URL.")
         return
 
-    yield sse("step", msg=f"Scraping {url} with Firecrawl...")
+    # Let Firecrawl extract structured data directly (no Gemini quota used).
+    yield sse("step", msg=f"Extracting structured data from {url} with Firecrawl...")
     try:
-        scraped = await asyncio.to_thread(firecrawl.scrape, url)
+        data = await asyncio.to_thread(_firecrawl_extract, url, task)
     except Exception as e:
-        yield sse("error", msg=f"Scrape failed: {e}")
+        yield sse("error", msg=f"Firecrawl extraction failed: {e}")
         return
 
-    md = extract_markdown(scraped)[:50000]
-    if not md.strip():
-        yield sse("error", msg="No content returned from that URL.")
+    if not data:
+        yield sse("error", msg="No structured data returned from that URL.")
         return
 
-    yield sse("step", msg="Building your custom interface with Gemini...")
-
+    # Try the LLM for a custom AI-designed UI; fall back to a template on failure.
+    yield sse("step", msg="Designing your interface with AI...")
     prompt = f"""You are a UI generator. The user's goal: {task}
 
-Raw content from {url}:
---- BEGIN ---
-{md}
---- END ---
+Structured data (already extracted from {url}):
+{json.dumps(data, indent=2)[:30000]}
 
 Generate ONE self-contained HTML file:
-- Shows ONLY data relevant to the user's goal
-- Pick the best layout: table, card grid, or result list
+- Shows ONLY data relevant to the goal, populated with the REAL data above
+- Best layout: table, card grid, or result list
 - All CSS in a <style> block — zero external deps
-- Populate with REAL data from the content above (no placeholders)
-- No nav bars, ads, footers, login prompts, or unrelated chrome
-- Clean white background, system sans-serif font, subtle borders
-- Add a live JS filter/search input at top if that helps the task
+- Clean white background, system sans-serif, subtle borders
+- Add a live JS filter/search input at top if helpful
 - First line must be: <!DOCTYPE html>
 
-Return ONLY raw HTML. No markdown fences. No commentary."""
-
+Return ONLY raw HTML. No markdown fences."""
     try:
-        r = await asyncio.to_thread(gemini.generate_content, prompt)
-        yield sse("html", html=strip_fences(r.text))
+        r = await asyncio.to_thread(gemini_call, prompt, retries=2, model=gemini_mid)
+        yield sse("html", html=strip_fences(r))
     except Exception as e:
-        yield sse("error", msg=f"Gemini error: {e}")
+        yield sse("step", msg=f"AI unavailable ({str(e)[:40]}…) — using built-in template.")
+        yield sse("html", html=_template_ui(task, data))
 
 
 # ── AGENT mode ─────────────────────────────────────────────────────────────────
@@ -133,12 +253,14 @@ async def _agent_mode(url: str, task: str) -> AsyncIterator[str]:
         yield sse("error", msg="Agent returned no job ID.")
         return
 
-    yield sse("step", msg=f"Agent running (job {job_id[:8]}...)  — this may take 30–90s")
+    yield sse("step", msg=f"Agent running (job {job_id[:8]}...) — may take 60–120s")
 
     elapsed = 0
+    polls   = 0
     while True:
-        await asyncio.sleep(4)
-        elapsed += 4
+        await asyncio.sleep(10)
+        elapsed += 10
+        polls   += 1
         try:
             status = await asyncio.to_thread(firecrawl.get_agent_status, job_id)
         except Exception as e:
@@ -146,7 +268,8 @@ async def _agent_mode(url: str, task: str) -> AsyncIterator[str]:
             return
 
         state = getattr(status, "status", "processing")
-        yield sse("step", msg=f"Agent working... ({elapsed}s elapsed, status: {state})")
+        if polls % 3 == 0:  # log once every 30s instead of every 4s
+            yield sse("step", msg=f"Still working... ({elapsed}s elapsed)")
 
         if state in ("completed", "failed", "cancelled"):
             break
@@ -161,7 +284,7 @@ async def _agent_mode(url: str, task: str) -> AsyncIterator[str]:
         return
 
     result_str = json.dumps(data, indent=2) if isinstance(data, (dict, list)) else str(data)
-    yield sse("step", msg="Rendering agent results with Gemini...")
+    yield sse("step", msg="Rendering agent results with AI...")
 
     prompt = f"""The user wanted: {task}
 
@@ -178,23 +301,149 @@ Generate a clean self-contained HTML page presenting these results:
 Return ONLY raw HTML."""
 
     try:
-        r = await asyncio.to_thread(gemini.generate_content, prompt)
-        yield sse("html", html=strip_fences(r.text))
+        r = await asyncio.to_thread(gemini_call, prompt, model=gemini_mid)
+        yield sse("html", html=strip_fences(r))
     except Exception as e:
         yield sse("error", msg=f"Render failed: {e}")
 
 
-# ── BROWSER mode ───────────────────────────────────────────────────────────────
+# ── BROWSER mode — Phase 1: generate a form mirroring the real site ─────────────
 
 async def _browser_mode(url: str, task: str) -> AsyncIterator[str]:
-    yield sse("step", msg="Creating live browser session...")
+    """Phase 1: scrape the target site and generate a minimal form the user
+    fills in. No browser session is created yet (saves rate limit / credits).
+    The actual real-site automation happens in Phase 2 via /run-action."""
 
+    if not url:
+        yield sse("step", msg="No URL given — AI will infer the right site.")
+        md = ""
+    else:
+        yield sse("step", msg=f"Inspecting {url} to find the inputs it needs...")
+        try:
+            scraped = await asyncio.to_thread(firecrawl.scrape, url)
+            md = extract_markdown(scraped)[:30000]
+        except Exception as e:
+            yield sse("step", msg=f"Could not scrape ({e}); generating form from task alone.")
+            md = ""
+
+    yield sse("step", msg="Building a clean input form for your task...")
+
+    form_prompt = f"""You are a UI generator for a "No-UI Browser". The user's goal:
+{task}
+
+{('Here is the real page content so you know what inputs the site needs:' + chr(10) + '--- BEGIN ---' + chr(10) + md + chr(10) + '--- END ---') if md else 'No page content available — infer the fields a user would need to provide for this task.'}
+
+Generate ONE self-contained HTML form that collects ONLY the inputs needed to
+accomplish the goal on the real site (e.g. for a flight: from, to, date,
+passengers; for Airbnb: city, dates, guests). Rules:
+- Clean minimal form: labels + inputs, a single "Continue" submit button
+- Pick correct input types (date, number, text, select with real options if known)
+- Pre-fill values that are already stated in the user's goal
+- DO NOT ask for passwords or payment — those are handled later in the live browser
+- All CSS in a <style> block. White bg, system sans-serif. No external deps.
+- First line must be: <!DOCTYPE html>
+
+CRITICAL — include this exact submit script so the parent app receives the values:
+<script>
+document.querySelector('form').addEventListener('submit', function(e) {{
+  e.preventDefault();
+  const values = {{}};
+  new FormData(e.target).forEach((v, k) => values[k] = v);
+  window.parent.postMessage({{ type: 'form-submit', values }}, '*');
+}});
+</script>
+
+Return ONLY raw HTML. No markdown fences. No commentary."""
+
+    try:
+        r = await asyncio.to_thread(gemini_call, form_prompt, model=gemini_mid)
+        yield sse("form", html=strip_fences(r), url=url, task=task)
+    except Exception as e:
+        yield sse("error", msg=f"Form generation failed: {e}")
+
+
+# ── BROWSER mode — Phase 2: drive the real site with the user's data ────────────
+
+def _build_automation_code(user_data: dict, task: str,
+                           url: str, mode: str) -> str:
+    """Synchronous Gemini call that returns async-Playwright code (verified to
+    run in the sandbox's asyncio event loop)."""
+
+    if mode == "self":
+        handoff_rule = (
+            "- The user wants to TAKE OVER. Navigate to the correct page and fill "
+            "only the obvious search fields, then STOP before any login/booking/"
+            "payment. Print 'STEP: Ready for you — take over the live browser now.'"
+        )
+    else:
+        handoff_rule = (
+            "- The user wants the AGENT to proceed. Fill every field you can from "
+            "user_data and advance through the flow. When you reach a step needing "
+            "a password or payment, STOP and print "
+            "'STEP: Paused — enter your password/payment in the live browser.' "
+            "Do NOT invent secret credentials or card numbers."
+        )
+
+    plan_prompt = f"""Write ASYNC Playwright Python to complete this task on a real website.
+
+Task: {task}
+Starting URL: {url or 'navigate to the appropriate site'}
+
+CRITICAL: The following two variables are ALREADY DEFINED in the execution environment.
+DO NOT redefine, reassign, or shadow them — just use them:
+  cdp_url   = (string) CDP websocket URL for the live browser
+  user_data = {json.dumps(user_data)}  ← these are the REAL user values
+
+The code runs INSIDE an existing asyncio event loop. You MUST use the async API
+and await. NEVER use sync_playwright, asyncio.run, or browser.close().
+
+Use exactly this skeleton (do NOT add any user_data or cdp_url assignments):
+
+from playwright.async_api import async_playwright
+import json
+p = await async_playwright().start()
+browser = await p.chromium.connect_over_cdp(cdp_url)
+context = browser.contexts[0] if browser.contexts else await browser.new_context()
+page = context.pages[0] if context.pages else await context.new_page()
+
+# ── YOUR STEPS ──
+# Access user_data["field_name"] to get what the user typed
+# print("STEP: <description>") before each major action
+# Final line: print(json.dumps({{"status":"done","summary":"...","data":{{}}}}))
+
+Rules:
+- await page.goto(url, timeout=30000); await page.fill(sel, val); await page.click(sel)
+- Dismiss cookie banners: try: await page.click("button:has-text('Accept')", timeout=5000)
+  except Exception: pass
+- await page.wait_for_timeout(1500) between major interactions
+- Use user_data values to fill the real site's fields
+- Wrap risky steps in try/except and print what failed
+{handoff_rule}
+
+Return ONLY raw Python code. No markdown fences. No comments explaining user_data or cdp_url."""
+
+    r_text = gemini_call(plan_prompt)
+    code = strip_fences(r_text)
+    # Safety: strip any line that reassigns the injected globals
+    cleaned = "\n".join(
+        line for line in code.splitlines()
+        if not re.match(r"^\s*(cdp_url|user_data)\s*=", line)
+    )
+    return cleaned
+
+
+async def _run_action(url: str, task: str, user_data: dict, mode: str) -> AsyncIterator[str]:
+    yield sse("step", msg="Creating live browser session...")
     try:
         session = await asyncio.to_thread(
             lambda: firecrawl.browser(ttl=600, stream_web_view=True)
         )
     except Exception as e:
-        yield sse("error", msg=f"Browser session failed: {e}")
+        msg = str(e)
+        if "Rate limit" in msg or "RateLimit" in type(e).__name__:
+            yield sse("error", msg="Firecrawl browser rate limit (3/min). Wait ~30s and retry.")
+        else:
+            yield sse("error", msg=f"Browser session failed: {e}")
         return
 
     session_id = getattr(session, "id", None)
@@ -204,103 +453,70 @@ async def _browser_mode(url: str, task: str) -> AsyncIterator[str]:
 
     if live_url:
         yield sse("live_view", url=live_url,
-                  msg="Live browser is open — watch below, you can interact anytime")
+                  msg="Live browser is open — you can click in it anytime")
 
-    yield sse("step", msg="Generating step-by-step automation plan with Gemini...")
-
-    # Gemini generates Playwright Python for the task
-    plan_prompt = f"""Write Playwright Python code to complete this browser task.
-
-Task: {task}
-Starting URL: {url or 'navigate to the appropriate site'}
-
-The code runs inside a sandbox that already has:
-- Python 3.11 + playwright installed
-- A variable `cdp_url` (string) pointing to the live Chromium browser via CDP
-
-Your code MUST follow this exact structure:
-
-from playwright.sync_api import sync_playwright
-import json, time
-
-with sync_playwright() as p:
-    browser = p.chromium.connect_over_cdp(cdp_url)
-    context = browser.contexts[0] if browser.contexts else browser.new_context()
-    page = context.pages[0] if context.pages else context.new_page()
-
-    # ── YOUR STEPS HERE ──
-    # Use print("STEP: <description>") to report each major step
-    # At the very end print a JSON summary:
-    # print(json.dumps({{"status": "done", "summary": "what happened", "data": {{}}}}))
-
-Rules:
-- Use page.goto(), page.fill(), page.click(), page.wait_for_selector()
-- Accept cookie banners: try: page.click("button[aria-label*='Accept']", timeout=3000) except: pass
-- Add page.wait_for_timeout(1500) between major interactions
-- NEVER call browser.close() or playwright.stop()
-- Handle errors with try/except and print an error JSON if something fails
-- If the task needs user input data not specified (e.g. passenger name, credit card), print a STEP saying what's missing and stop gracefully
-
-Return ONLY raw Python code. No markdown fences."""
-
+    yield sse("step", msg="Planning the automation with your data...")
     try:
-        r = await asyncio.to_thread(gemini.generate_content, plan_prompt)
-        code = strip_fences(r.text)
+        code = await asyncio.to_thread(
+            _build_automation_code, user_data, task, url, mode
+        )
     except Exception as e:
-        yield sse("error", msg=f"Failed to generate plan: {e}")
+        yield sse("error", msg=f"Failed to plan automation: {e}")
         await _kill_browser(session_id)
         return
 
-    # Inject the cdp_url as the first line so generated code can use it
-    injected_code = f"cdp_url = {json.dumps(cdp_url or '')}\n\n{code}"
+    injected = f"cdp_url = {json.dumps(cdp_url or '')}\nuser_data = {json.dumps(user_data)}\n\n{code}"
 
-    yield sse("step", msg="Executing automation in the live browser...")
-
+    yield sse("step", msg="Driving the real website...")
+    stdout = ""
     try:
         exec_resp = await asyncio.to_thread(
             lambda: firecrawl.browser_execute(
-                session_id, injected_code, language="python", timeout=120
+                session_id, injected, language="python", timeout=120
             )
         )
         stdout = (getattr(exec_resp, "stdout", None)
                   or getattr(exec_resp, "output", None)
-                  or getattr(exec_resp, "result", None)
-                  or "")
+                  or getattr(exec_resp, "result", None) or "")
         stderr = getattr(exec_resp, "stderr", None) or ""
         exit_code = getattr(exec_resp, "exit_code", None)
 
-        # Stream STEP progress lines from stdout
         for line in stdout.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("STEP:"):
-                yield sse("step", msg=stripped[5:].strip())
+            s = line.strip()
+            if s.startswith("STEP:"):
+                yield sse("step", msg=s[5:].strip())
 
-        combined = (stdout + "\n" + stderr).strip()
-        yield sse("step", msg=f"Automation finished (exit {exit_code}). Rendering outcome...")
+        if exit_code not in (0, None):
+            yield sse("step", msg=f"Automation exited with code {exit_code}.")
 
+        yield sse("step", msg="Rendering the outcome...")
         render_prompt = f"""The user wanted: {task}
+They provided: {json.dumps(user_data)}
 
-Browser automation produced this output:
+Browser automation output:
 --- STDOUT ---
 {stdout[:8000]}
 --- STDERR ---
 {stderr[:2000]}
 
 Generate a self-contained HTML page that:
-- Clearly states what was accomplished (or what's missing / needs user input)
-- Shows any data/results found
-- If something is missing (e.g. payment details), shows a friendly prompt explaining what the user needs to provide next
-- Clean white bg, system sans-serif
-- First line: <!DOCTYPE html>
+- States clearly what was accomplished on the real site
+- Shows any results/data found (prices, confirmations, options)
+- If it paused for the user (password/payment), say so and tell them to finish
+  in the live browser tab
+- Clean white bg, system sans-serif. First line: <!DOCTYPE html>
 
 Return ONLY raw HTML."""
-
-        r2 = await asyncio.to_thread(gemini.generate_content, render_prompt)
-        yield sse("html", html=strip_fences(r2.text))
+        r2 = await asyncio.to_thread(gemini_call, render_prompt, model=gemini_mid)
+        yield sse("html", html=strip_fences(r2))
 
     except Exception as e:
         yield sse("error", msg=f"Execution error: {e}")
-    finally:
+
+    # Keep the session alive for human takeover; it expires via its 600s TTL.
+    if mode == "self" or "paus" in stdout.lower() or "take over" in stdout.lower():
+        yield sse("step", msg="Live browser stays open for you to finish.")
+    else:
         await _kill_browser(session_id)
 
 
@@ -355,6 +571,40 @@ async def execute(req: ExecuteRequest):
     )
 
 
+# ── Phase 2: run the real-site automation with the user's form data ─────────────
+
+class RunActionRequest(BaseModel):
+    url: Optional[str] = ""
+    task: str
+    user_data: dict = {}
+    mode: str = "agent"  # "agent" | "self"
+
+
+@app.post("/run-action")
+async def run_action(req: RunActionRequest):
+    url  = (req.url or "").strip()
+    task = req.task.strip()
+    mode = req.mode if req.mode in ("agent", "self") else "agent"
+
+    if not task:
+        raise HTTPException(status_code=400, detail="task is required")
+
+    async def stream():
+        try:
+            yield sse("mode", mode="browser", label=MODE_DESC["browser"])
+            async for ev in _run_action(url, task, req.user_data, mode):
+                yield ev
+            yield sse("done", msg="Action complete.")
+        except Exception as e:
+            yield sse("error", msg=f"Unexpected error: {e}")
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 # ── Legacy simple endpoint ────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
@@ -382,8 +632,8 @@ Generate one self-contained HTML with only data relevant to the goal.
 Real data from above. <!DOCTYPE html> first. No external deps.
 Return ONLY raw HTML."""
 
-    r = await asyncio.to_thread(gemini.generate_content, prompt)
-    return {"html": strip_fences(r.text)}
+    r = await asyncio.to_thread(gemini_call, prompt)
+    return {"html": strip_fences(r)}
 
 
 # ── Static serving ────────────────────────────────────────────────────────────
