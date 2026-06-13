@@ -30,3 +30,26 @@ furthermore analyzes audio .mp3 and sees for spikes and etc since AI can't speak
 
 
 **
+
+
+
+
+
+1. "ScamHunter" (Probably my favorite)
+Problem:
+People get investment offers, internships, startup partnerships, sponsorship requests, recruiting emails, etc. Nobody knows if they're real.
+Demo:
+User pastes:
+"Congratulations! We're from XYZ Capital and want to invest $2M..."
+Your system:
+Firecrawl crawls company website
+Firecrawl crawls LinkedIn/company pages
+Gemini analyzes:
+domain age
+team legitimacy
+funding claims
+online presence
+scam signals
+inconsistencies
+Output:
+"92% likely legitimate"
